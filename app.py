@@ -89,7 +89,7 @@ with tab1:
 
                 if bill:
                     df = pd.DataFrame(bill)
-                    df["check"] = df.flags.apply(lambda f: "⚠️ " + "; ".join(f) if f else "✓")
+                    df["check"] = df["flags"].apply(lambda f: "⚠️ " + "; ".join(f) if f else "✓")
                     st.subheader("Order summary: please confirm")
                     st.dataframe(df[["product", "qty", "unit", "packs", "rate", "amount", "check"]].rename(
                         columns={"rate": "₹/pack", "amount": "₹ amount"}), use_container_width=True, hide_index=True)
