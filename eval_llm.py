@@ -32,11 +32,34 @@ TESTS = [
  ("good day cashew 200 gm 3 peti", [("SKU0374", 3, "peti")]),
 ]
 
-def run(key=None):
+# FRESH test set, written on 29 Oct BEFORE the matcher was changed, never used to tune anything.
+# Heavier on Hinglish (do / teen / char / ek / bhej do / aur) to check that the fix doesn't hurt Hinglish handling.
+TESTS_NEW = [
+ ("bhaiya 3 peti maggi special masala 70 gm bhej do", [("SKU0584", 3, "peti")]),
+ ("do peti tata salt 1 kg", [("SKU0181", 2, "peti")]),
+ ("char peti britannia marie gold 250 gm aur 2 peti bingo achaari masti 130 gm", [("SKU0395", 4, "peti"), ("SKU0458", 2, "peti")]),
+ ("5 packet bru coffee 50 gm", [("SKU0286", 5, "packet")]),
+ ("kurkure chilli chatka 81 gm teen peti", [("SKU0445", 3, "peti")]),
+ ("amul butter 2 peti", [("ASK", 2, "peti")]),
+ ("1 peti dabur honey 500 gm, 2 peti nescafe classic 50 gm", [("SKU0574", 1, "peti"), ("SKU0288", 2, "peti")]),
+ ("lizol 2 peti", [("ASK", 2, "peti")]),
+ ("10 packet vim liquid", [("NOT_FOUND", 10, "packet")]),
+ ("2 peti parle monaco classic 200 gm", [("SKU0403", 2, "peti")]),
+ ("haldiram aloo bhujia 350 gm ek peti", [("SKU0432", 1, "peti")]),
+ ("2 peti sprite 750 ml", [("NOT_FOUND", 2, "peti")]),
+ ("saffola gold 5 litre 1 peti", [("SKU0031", 1, "peti")]),
+ ("parle-g 50 gm 2 peti aur dairy milk 126 gm 1 peti", [("SKU0387", 2, "peti"), ("SKU0513", 1, "peti")]),
+ ("ek dabba fortune sunlite 15 litre", [("SKU0023", 1, "dabba")]),
+]
+
+def run(key=None, tests=None, label=""):
     n = right = halluc = qty_ok = unit_ok = 0; fails = []; tokens = [0, 0]
-    for msg, gold in TESTS:
+    errors = []
+    tests = tests or TESTS
+    for msg, gold in tests:
         r = E.process(msg, None, key)
         if r.get("usage"): tokens[0] += r["usage"].get("prompt_tokens", 0); tokens[1] += r["usage"].get("completion_tokens", 0)
+        if r.get("error"): errors.append(r["error"])
         got = [] if r.get("blocked") else r["results"]
         for i, (sku, q, u) in enumerate(gold):
             n += 1
@@ -47,11 +70,16 @@ def run(key=None):
             if x["status"] == "ok" and d != sku: halluc += 1
             if d == sku and qok and uok: right += 1
             else: fails.append((msg, f"expected {sku} {q} {u} | got {d} {x['line']['qty']} {x['line']['unit']}"))
-    print(f"engine={'LLM ' + os.environ.get('OPENAI_MODEL', 'gpt-4o-mini') if key else 'rule-based baseline'}")
+    print(f"\n=== {label} ===  engine={'LLM ' + os.environ.get('OPENAI_MODEL', 'gpt-4o-mini') if key else 'rule-based baseline'}")
     print(f"lines={n}  fully correct={right/n:.0%}  qty correct={qty_ok/n:.0%}  unit correct={unit_ok/n:.0%}  "
           f"wrong/hallucinated product picks={halluc}")
     if key: print(f"tokens in/out = {tokens[0]}/{tokens[1]}")
+    if errors:
+        print(f"!! {len(errors)} of {len(tests)} AI calls FAILED, so these results are NOT the AI's. First error:")
+        print("   ", errors[0])
     for f in fails: print("  FAIL:", f)
 
 if __name__ == "__main__":
-    run(os.environ.get("OPENAI_API_KEY"))
+    k = os.environ.get("OPENAI_API_KEY")
+    run(k, TESTS, "ORIGINAL test set (20 messages, 24 lines)")
+    run(k, TESTS_NEW, "FRESH test set (15 messages, 18 lines, never used for tuning)")

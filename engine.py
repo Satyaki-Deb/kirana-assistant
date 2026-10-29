@@ -28,6 +28,7 @@ SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(kg|kilo|kgs|g|gm|gms|gram|grams|l|ltr|
 INJECTION_RE = re.compile(r"ignore (all|any|previous|the|your)|system prompt|you are now|disregard|"
                           r"\b(discount|free|price kam|0 rupees|rs ?0)\b|reveal|jailbreak|act as|<\s*/?\s*system", re.I)
 MAX_CHARS, MAX_QTY = 500, 200
+ASK_MARGIN = 0.06   # was 0.04; picked on the ORIGINAL (practice) set as the smallest margin with zero wrong picks
 
 # ---------------------------------------------------------------- guardrail
 def input_guardrail(msg: str):
@@ -54,9 +55,13 @@ def parse_size(text):
 CAT["m_size"] = CAT.pack_size.apply(parse_size)
 def _tokens(s):
     return [t for t in re.sub(r"[^a-z0-9 ]", " ", s.lower().replace("-", " ")).split() if t]
-CAT["m_tok"] = [set(_tokens(SIZE_RE.sub(" ", n)) + [t for a in str(al).split("|") for t in _tokens(a)])
+def _with_joined(toks):
+    toks = list(toks)
+    return set(toks) | {a + b for a, b in zip(toks, toks[1:])}   # "max fresh" -> also "maxfresh"
+CAT["m_tok"] = [_with_joined(_tokens(SIZE_RE.sub(" ", n))) | {t for a in str(al).split("|") for t in _with_joined(_tokens(a))}
                for n, al in zip(CAT.product_name, CAT.aliases)]
 CAT["m_core"] = [set(_tokens(SIZE_RE.sub(" ", n))) - {"gm","g","ml","l","kg","x"} for n in CAT.product_name]
+CORE = dict(zip(CAT.sku_id, CAT.m_core))
 CAT["m_alias"] = [set(a.strip() for a in str(al).split("|")) | {b.lower()} for al, b in zip(CAT.aliases, CAT.brand)]
 
 # ---------------------------------------------------------------- extraction
@@ -102,7 +107,12 @@ def llm_extract(msg: str, api_key: str, model: str = None):
     if not model.startswith(("gpt-5", "o")): body["temperature"] = 0
     req = urllib.request.Request("https://api.openai.com/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
+    ctx = None
+    try:                                  # Windows Python often lacks root certificates; certifi fixes that
+        import ssl, certifi; ctx = ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        pass
+    with urllib.request.urlopen(req, timeout=30, context=ctx) as r:
         resp = json.loads(r.read())
     out = json.loads(resp["choices"][0]["message"]["content"])
     usage = resp.get("usage", {})
@@ -135,6 +145,10 @@ def _tok_score(raw_tokens, sku_tokens):
         tot += best if best >= 0.75 else 0
     return tot / len(raw_tokens)
 
+def _covered(t, sku_tokens):
+    if t in sku_tokens or len(t) < 3 or t.isdigit(): return True
+    return max((difflib.SequenceMatcher(None, t, s).ratio() for s in sku_tokens), default=0) >= 0.75
+
 def match(line, store_id=None, k=4):
     """Scores all 1,178 SKUs for one order line; returns top-k candidates [(score, sku_id)]."""
     raw = line["raw_item"].lower()
@@ -148,21 +162,30 @@ def match(line, store_id=None, k=4):
         core = row.m_core                              # reverse check: how much of the product NAME was said
         if core: s += 0.2 * sum(1 for t in core if t in raw_tokens) / len(core)
         if size and row.m_size:
-            s += 0.25 if abs(row.m_size[0] - size[0]) < 1e-6 and row.m_size[1] == size[1] else -0.3
+            s += 0.25 if abs(row.m_size[0] - size[0]) <= 0.05 * size[0] and row.m_size[1] == size[1] else -0.3  # shopkeepers round: 77 gm = 77.2 gm
         if line.get("unit") == "dabba" and row.bulk_unit == "dabba": s += 0.15
         if line.get("unit") == "bori" and row.bulk_unit == "bori": s += 0.15
         if row.sku_id in bought: s += 0.12          # this store's own history breaks ties
-        scores.append((round(s, 3), row.sku_id))
+        complete = raw.strip() in row.m_alias or all(_covered(t, row.m_tok) for t in raw_tokens)
+        scores.append((round(s, 3), row.sku_id, complete))
     scores.sort(key=lambda x: (-x[0], BY_ID.loc[x[1], "mrp_inr"]))
     return scores[:k]
 
 def resolve(line, store_id=None):
     """Decides: 'ok' (one clear SKU), 'ask' (follow-up question with options) or 'not_found'."""
     cands = match(line, store_id)
-    if not cands or cands[0][0] < 0.7:
+    # Change 2: if a meaningful word in the message matches nothing in the best product, we don't stock it
+    if not cands or cands[0][0] < 0.7 or not cands[0][2]:
         return dict(status="not_found", line=line, options=[c[1] for c in cands[:3]])
-    if len(cands) > 1 and cands[1][0] >= cands[0][0] - 0.04:
-        return dict(status="ask", line=line, options=[c[1] for c in cands if c[0] >= cands[0][0] - 0.04][:4])
+    # Change 1: ask whenever the runner-up is close (margin 0.06, was 0.04); store history (+0.12) still settles it
+    close = [c for c in cands if c[0] >= cands[0][0] - ASK_MARGIN]
+    # ...but if the shopkeeper wrote one product's full name (no extra words unsaid), take it: "tata salt" = Tata Salt, not Tata Salt Lite
+    raw_tokens = set(_tokens(SIZE_RE.sub(" ", line["raw_item"].lower())))
+    exact = [c for c in close if CORE[c[1]] <= raw_tokens] if len(close) > 1 else []
+    if len(exact) == 1:
+        return dict(status="ok", line=line, sku_id=exact[0][1], score=exact[0][0])
+    if len(close) > 1:
+        return dict(status="ask", line=line, options=[c[1] for c in close][:4])
     return dict(status="ok", line=line, sku_id=cands[0][1], score=cands[0][0])
 
 # ---------------------------------------------------------------- pricing + flags + nudge (all plain code)
@@ -203,7 +226,7 @@ def process(msg, store_id, api_key=None):
         try:
             extracted, usage = llm_extract(msg, api_key); engine = "llm"
         except Exception as e:
-            err = f"LLM unavailable ({type(e).__name__}); used rule-based parser"
+            err = f"LLM unavailable ({type(e).__name__}: {str(e)[:200]}); used rule-based parser"
             extracted = rule_extract(msg)
     else:
         extracted = rule_extract(msg)
